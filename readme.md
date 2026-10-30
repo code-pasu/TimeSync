@@ -1,5 +1,38 @@
 # SDN-Assisted UDP Time Synchronization in Mininet (with OS-Ken)
 
+## Quick Install on Ubuntu/Debian
+
+From a new Ubuntu or Debian machine, install the complete project from GitHub with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/USER/REPOSITORY/main/install.sh \
+  | bash -s -- https://github.com/USER/REPOSITORY.git "$HOME/TimeSync"
+```
+
+Replace `USER/REPOSITORY` with the GitHub owner and repository name. The installer:
+
+* Installs Git, Python, Mininet, Open vSwitch, and build tools with `apt`.
+* Starts and enables the Open vSwitch service.
+* Installs `uv` for the current user.
+* Clones the repository and creates `.venv` with `uv sync`.
+* Compiles the project files to verify the installation.
+
+After installation, use two terminals:
+
+```bash
+cd "$HOME/TimeSync"
+uv run osken-manager sdn_controller.py
+```
+
+In the second terminal:
+
+```bash
+cd "$HOME/TimeSync"
+sudo -E "$HOME/TimeSync/.venv/bin/python" topology.py
+```
+
+The topology needs root privileges because Mininet creates network namespaces and virtual interfaces.
+
 ## 1. Project Overview
 This project implements a Network Time Protocol (NTP)-style clock synchronization application over **UDP sockets**, deployed inside a **Mininet** virtual network and managed by an **OS-Ken** Software-Defined Networking (SDN) controller.
 
