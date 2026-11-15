@@ -177,13 +177,14 @@ mininet> h2 .venv/bin/python time_sync.py --role client --offset 2.5
 * **What it does:** Starts the UDP reference server on `h1` in the background (`&`), then runs 30 synchronization exchanges from `h2` with a simulated clock offset of `+2.5` seconds.
 * **Expected Output & Analysis:**
   ```text
-  seq,rtt_ms,estimated_offset_s,sync_error_ms
-  1,50.331,-2.487989,12.011
-  2,20.352,-2.499998,0.002
-  3,20.400,-2.499992,0.008
+  Time sync results:
+  seq=1, rtt_ms=50.331, estimated_offset_s=-2.487989, sync_error_ms=12.011
+  seq=2, rtt_ms=20.352, estimated_offset_s=-2.499998, sync_error_ms=0.002
+  seq=3, rtt_ms=20.400, estimated_offset_s=-2.499992, sync_error_ms=0.008
   ...
-  30,20.355,-2.499994,0.006
+  seq=30, rtt_ms=20.355, estimated_offset_s=-2.499994, sync_error_ms=0.006
   ```
+  Each result line shows the sequence number, round-trip time in milliseconds, estimated clock offset in seconds, and synchronization error in milliseconds.
   * **Why Packet #1 has ~50 ms RTT and ~12 ms Error:** On the very first packet, `s1` does not have a flow rule for `h2 -> h1` UDP port `5005`. It encapsulates the packet into an OpenFlow `Packet-In` message to the OS-Ken controller. This control-plane detour delays only the forward path ($T_1 \to T_2$), creating path asymmetry and a `~12 ms` error.
   * **Why Packets #2–#30 have ~20.3 ms RTT and <0.05 ms Error:** Once OS-Ken installs the OpenFlow rule (`Priority 100 -> Queue 1`), subsequent packets are switched directly in the Open vSwitch kernel fast-path. Forward delay (`10 ms`) equals return delay (`10 ms`), yielding near-zero synchronization error (`0.001 ms – 0.05 ms`).
 
