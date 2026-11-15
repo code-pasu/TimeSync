@@ -20,7 +20,7 @@ dist/
 # Generated evaluation logs and plots
 *.log
 *.csv
-*.png
+.png
 
 # Local environment and editor files
 .env
