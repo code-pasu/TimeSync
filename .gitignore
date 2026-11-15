@@ -17,6 +17,11 @@ build/
 dist/
 *.egg-info/
 
+# Generated evaluation logs and plots
+*.log
+*.csv
+*.png
+
 # Local environment and editor files
 .env
 .env.*

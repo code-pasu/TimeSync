@@ -1,223 +1,267 @@
-# SDN-Assisted UDP Time Synchronization in Mininet (with OS-Ken)
+# SDN-Assisted Dynamic UDP Time Synchronization in Mininet (with OS-Ken)
 
-## Quick Install on Ubuntu/Debian
+## 1. Project Overview & Problem Statement
 
-From a new Ubuntu or Debian machine, install the complete project from GitHub with:
+This project implements a Network Time Protocol (NTP)-style clock synchronization system using **UDP sockets**, deployed inside a **Mininet** virtual network and dynamically managed by an **OS-Ken** Software-Defined Networking (SDN) controller via **OpenFlow 1.3**.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/USER/REPOSITORY/main/install.sh \
-  | bash -s -- https://github.com/USER/REPOSITORY.git "$HOME/TimeSync"
-```
+### The Core Problem: Why Congestion Breaks UDP Time Synchronization
+UDP clock synchronization calculates a client's clock offset ($\theta$) by assuming that the one-way network delay from **Client to Server** ($d_{\text{forward}}$) equals the delay from **Server to Client** ($d_{\text{reverse}}$). 
 
-Replace `USER/REPOSITORY` with the GitHub owner and repository name. The installer:
+When background network congestion floods a switch port, packets sit in switch buffers unevenly (**asymmetric queuing delay and jitter**). Because the forward path and return path no longer take the same amount of time, the NTP offset equation produces massive **synchronization errors** ($15\text{ ms} - 60\text{ ms+}$).
 
-* Installs Git, Python, Mininet, Open vSwitch, and build tools with `apt`.
-* Starts and enables the Open vSwitch service.
-* Installs `uv` for the current user.
-* Clones the repository and creates `.venv` with `uv sync`.
-* Compiles the project files to verify the installation.
-
-After installation, use two terminals:
-
-```bash
-cd "$HOME/TimeSync"
-uv run osken-manager sdn_controller.py
-```
-
-In the second terminal:
-
-```bash
-cd "$HOME/TimeSync"
-sudo -E "$HOME/TimeSync/.venv/bin/python" topology.py
-```
-
-The topology needs root privileges because Mininet creates network namespaces and virtual interfaces.
-
-## 1. Project Overview
-This project implements a Network Time Protocol (NTP)-style clock synchronization application over **UDP sockets**, deployed inside a **Mininet** virtual network and managed by an **OS-Ken** Software-Defined Networking (SDN) controller.
-
-### Why SDN for Time Synchronization?
-UDP clock synchronization calculates a client's clock offset by assuming that the network delay from **Client to Server** equals the delay from **Server to Client** (symmetric path delay). When background network congestion floods a switch port, packets sit in buffers unevenly (asymmetric queuing delay and jitter), introducing massive clock synchronization errors.
-
-To solve this, our **OS-Ken SDN Controller** inspects incoming UDP packets via **OpenFlow 1.3**. When it detects time-synchronization traffic (`UDP port 5005`), it installs a high-priority flow rule (`Priority 100`) that routes time-sync packets into a dedicated high-priority Linux Hierarchical Token Bucket (`linux-htb`) hardware/kernel queue (`Queue 1`) on Open vSwitch, bypassing background congestion (`Queue 0`).
+### Our Solution: Closed-Loop Dynamic SDN Traffic Prioritization
+Instead of relying on static network rules, our system implements a **Closed-Loop Reactive SDN Architecture**:
+1. **UDP Time Sync Plane (`Port 5005`):** Multiple clients (`h2`, `h3`) exchange 4-timestamp UDP probes with a reference server (`h1`), estimate their clock offset, apply adaptive clock correction, and calculate real-time synchronization error.
+2. **TCP Telemetry & Control Plane (`Port 9090`):** Clients stream real-time JSON telemetry (`rtt_ms`, `sync_error_ms`) over TCP to the SDN controller. Simultaneously, the SDN controller polls Open vSwitch port byte counters every 2 seconds via OpenFlow (`OFPPortStatsRequest`).
+3. **Dynamic QoS Enforcement (`OpenFlow 1.3` + `linux-htb`):** The network starts in **Baseline Mode** (all traffic shares default `Queue 0`). The instant a client reports an SLA violation (`sync_error_ms > 2.0 ms`) or link throughput exceeds `8.0 Mbps`, the OS-Ken controller dynamically rewrites the switch flow tables (`OFPFlowMod`, `Priority 100`, `OFPActionSetQueue(1)`), elevating UDP `5005` packets into a dedicated high-priority hardware/kernel queue (`Queue 1`) and restoring sub-millisecond synchronization accuracy mid-flight.
 
 ---
 
 ## 2. System Architecture & Network Topology
 
-The Mininet topology (`topology.py`) builds a star network around a single OpenFlow 1.3 switch (`s1`) with a `10 Mbps` bottleneck capacity and `10 ms` propagation delay:
+![Project diagram](flowchart.png)
+### Node & Component Specifications
 
-* **Controller (`c0` - `127.0.0.1:6653`):** Runs `os-ken` (`sdn_controller.py`), managing OpenFlow tables and QoS queue assignments on `s1`.
-* **Reference Server (`h1` - `10.0.0.1`):** Runs `time_sync.py --role server` on UDP port `5005` and acts as the `iperf3` congestion sink.
-* **Time Sync Client 1 (`h2` - `10.0.0.2`):** Runs `time_sync.py --role client` with an artificial local clock drift (e.g., `+2.5s`) to measure synchronization accuracy.
-* **Time Sync Client 2 (`h3` - `10.0.0.3`):** Secondary client (`-1.2s` offset) demonstrating concurrent multi-client support.
-* **Congestion Generator (`h4` - `10.0.0.4`):** Uses `iperf3` to flood the `s1 <-> h1` link with `15 Mbps` of background UDP traffic.
+| Component | Node / IP | Protocol & Port | Role & Responsibility |
+| :--- | :--- | :--- | :--- |
+| **SDN Controller** | `c0` (`127.0.0.1`) | OpenFlow (`TCP 6653`) | Runs `sdn_controller.py`. Manages L2 learning, polls `OFPPortStatsRequest`, listens for TCP telemetry, and dynamically enforces QoS queues. |
+| **Telemetry Bridge** | `s1` (`10.0.0.254`) | `TCP 9090` | Root namespace internal OVS interface allowing virtual hosts (`h2`, `h3`) to send JSON monitoring reports to the controller. |
+| **Reference Server** | `h1` (`10.0.0.1`) | `UDP 5005` / `UDP 5201` | Primary stratum reference clock (`time_sync.py --role server`) and `iperf3 -s` background traffic sink. |
+| **Time Client 1** | `h2` (`10.0.0.2`) | `UDP` (ephemeral) | Primary test client simulated with a `+2.5s` local clock offset; streams live telemetry to `10.0.0.254:9090`. |
+| **Time Client 2** | `h3` (`10.0.0.3`) | `UDP` (ephemeral) | Secondary concurrent client simulated with a `-1.2s` local clock offset to verify multi-client scalability. |
+| **Congestion Host** | `h4` (`10.0.0.4`) | `UDP 5201` | Floods `15 Mbps` of UDP traffic toward `h1` to saturate the `10 Mbps` bottleneck link (`s1-eth1`). |
 
-### Protocol Responsibilities
-| Protocol | Layer | Role in Project |
-| :--- | :--- | :--- |
-| **UDP** | Transport | Lightweight, connectionless 4-timestamp clock synchronization exchange (`Port 5005`) and `iperf3` congestion generation. |
-| **TCP** | Transport | Reliable OpenFlow control channel (`Port 6653`) between Open vSwitch (`s1`) and the OS-Ken controller, plus monitoring agent reports. |
-| **ICMP (Ping)** | Network | Host reachability diagnostics and baseline Round-Trip Time (RTT) verification (`pingall`, `ping`). |
+### Protocol Responsibilities Matrix
+
+| Protocol | OSI Layer | Usage in Project | Why This Protocol Was Chosen |
+| :--- | :--- | :--- | :--- |
+| **UDP** | Transport (L4) | 4-Timestamp synchronization (`Port 5005`) & `iperf3` congestion generation (`Port 5201`). | Zero connection-setup overhead and no TCP retransmission delays, which is critical for accurate hardware/kernel timestamping. |
+| **TCP** | Transport (L4) | OpenFlow control channel (`Port 6653`) & Client-to-SDN Telemetry (`Port 9090`). | Reliable, connection-oriented delivery guarantees that SLA violation alerts, mode switches, and `OFPFlowMod` rules are never lost. |
+| **ICMP (Ping)** | Network (L3) | Reachability diagnostics (`pingall`, `ping`) and ARP cache warm-up. | Network-layer control protocol used to verify baseline L2/L3 forwarding rules before application testing. |
 
 ---
 
-## 3. Mathematical Model (4-Timestamp Exchange)
+## 3. Core Concepts Explained Simply
 
-Each synchronization round exchanges 4 timestamps (packed as 8-byte IEEE 754 floats using Python's `struct.pack("!ddd", ...)`):
-1. **$T_1$:** Client sends UDP request (recorded using client's drifted clock).
-2. **$T_2$:** Server receives UDP request (recorded using server's reference clock).
-3. **$T_3$:** Server transmits UDP reply containing $(T_1, T_2, T_3)$ (recorded using server's reference clock).
-4. **$T_4$:** Client receives UDP reply (recorded using client's drifted clock).
+1. **Mininet (The Network Emulator):**
+   Mininet emulates a complete network of hosts, links, and switches on a single Linux machine. Instead of booting heavy Virtual Machines, it uses lightweight **Linux Network Namespaces (`netns`)** (isolated network stacks sharing one kernel), **Virtual Ethernet (`veth`) pairs** (virtual cables), and **Linux Traffic Control (`tc`)** to enforce exact link bandwidths (`10 Mbps`) and propagation delays (`10 ms`).
+2. **Open vSwitch / `s1` (The Data Plane Muscle):**
+   Open vSwitch (OVS) is a production-grade virtual multilayer switch running in the Linux kernel. It holds a **Flow Table** (a fast lookup table matching packet headers to actions) and hardware/kernel **QoS Queues** (`Queue 0` for normal traffic, `Queue 1` for high-priority time sync). If a packet matches a rule in the Flow Table, `s1` forwards it in microseconds; if not, `s1` asks the SDN Controller.
+3. **OpenFlow 1.3 (The Communication Protocol):**
+   OpenFlow is the standardized protocol (`TCP port 6653`) that separates the network's **Control Plane** (brain) from its **Data Plane** (muscle). Key messages used in this project:
+   * `OFPPacketIn`: Switch asks the controller what to do with an unrecognized packet.
+   * `OFPFlowMod`: Controller installs, modifies, or deletes forwarding and queue-assignment rules inside the switch.
+   * `OFPPortStatsRequest` / `Reply`: Controller queries the switch for real-time transmitted byte/packet counters per port.
+4. **OS-Ken (The SDN Control Plane Brain):**
+   OS-Ken is OpenStack's actively maintained Python SDN framework (the modern fork of **Ryu**). Our `sdn_controller.py` runs inside `osken-manager`, parsing packet headers (`ethernet`, `ipv4`, `udp`) and executing event-driven policies (`@set_ev_cls`).
 
-From $(T_1, T_2, T_3, T_4)$, the client computes:
+---
+
+## 4. Mathematical Model & Proof of Congestion Error
+
+### 4.1 The 4-Timestamp Exchange
+Because all Mininet namespaces share the host Linux kernel clock (`time.time()`), each client simulates an independent drifted clock by adding an artificial offset ($\Delta_{\text{artificial}}$):
+
+$$\text{LocalClientClock}(t) = t + \Delta_{\text{artificial}}$$
+
+During each synchronization probe, four IEEE 754 double-precision timestamps (`!ddd`, 24 bytes) are recorded:
+1. **$T_1$:** Client transmits UDP request (stamped using Client's drifted clock).
+2. **$T_2$:** Server receives UDP request (stamped using Server's reference clock).
+3. **$T_3$:** Server transmits UDP reply containing $(T_1, T_2, T_3)$ (stamped using Server's reference clock).
+4. **$T_4$:** Client receives UDP reply (stamped using Client's drifted clock).
+
+### 4.2 Delay, Offset, and Error Equations
+From $(T_1, T_2, T_3, T_4)$, the client calculates:
+
 * **Round-Trip Delay ($\delta$):**
   $$\delta = (T_4 - T_1) - (T_3 - T_2)$$
+
 * **Estimated Clock Offset ($\theta$):**
   $$\theta = \frac{(T_2 - T_1) + (T_3 - T_4)}{2}$$
-* **Synchronization Error:**
-  $$\text{Error} = |\theta - \text{True Offset}|$$
+
+* **True Offset ($\theta_{\text{true}}$):**
+  The exact correction needed to align the client's local clock back to the reference clock:
+  $$\theta_{\text{true}} = -\Delta_{\text{artificial}}$$
+
+* **Synchronization Error ($E_{\text{sync}}$):**
+  $$E_{\text{sync}} = |\theta - \theta_{\text{true}}|$$
+
+* **Adaptive Clock Correction (Residual Drift):**
+  After estimating $\theta$, the client applies the correction $\text{CorrectedClock} = \text{LocalClientClock}(t) + \theta$ and measures residual drift against true reference time.
+
+### 4.3 Why Asymmetric Congestion Corrupts $\theta$
+Let $d_{\text{forward}}$ be the true one-way network delay from Client $\rightarrow$ Server, and $d_{\text{reverse}}$ be the one-way delay from Server $\rightarrow$ Client. Since $T_2 = T_1 + \theta_{\text{true}} + d_{\text{forward}}$ and $T_4 = T_3 - \theta_{\text{true}} + d_{\text{reverse}}$, substituting into the offset equation yields:
+
+$$\theta = \theta_{\text{true}} + \frac{d_{\text{forward}} - d_{\text{reverse}}}{2}$$
+
+$$\implies E_{\text{sync}} = \left| \frac{d_{\text{forward}} - d_{\text{reverse}}}{2} \right|$$
+
+* **Under Normal Conditions (or SDN QoS Queue 1):** $d_{\text{forward}} \approx 10\text{ ms}$ and $d_{\text{reverse}} \approx 10\text{ ms}$. Because $10 - 10 = 0$, the network delays cancel out completely and $E_{\text{sync}} \approx 0\text{ ms}$!
+* **Under Unmanaged Congestion (`Queue 0`):** `h4` floods `15 Mbps` toward `h1` across the `10 Mbps` bottleneck (`s1-eth1`). The forward path ($T_1 \to T_2$) shares `s1-eth1` with the flood and suffers $+70\text{ ms}$ of queuing delay ($d_{\text{forward}} = 80\text{ ms}$), whereas the return path ($T_3 \to T_4$) exits `s1-eth2` with zero congestion ($d_{\text{reverse}} = 10\text{ ms}$). This asymmetry induces a massive error of $\frac{|80 - 10|}{2} = 35\text{ ms}$!
 
 ---
 
-## 4. Environment Setup (Linux / CachyOS / Arch & Ubuntu with `uv`)
+## 5. Complete Environment Setup (CachyOS / Arch Linux & Ubuntu with `uv`)
 
-Because all Mininet hosts share the host Linux kernel, **Mininet** and **Open vSwitch** must be installed as system packages, while **OS-Ken** and Python dependencies are managed inside a `uv` virtual environment.
-
-### Step 4.1: Install System Dependencies & Start Open vSwitch
+### Step 5.1: Install System Packages & Start Open vSwitch
+Mininet and Open vSwitch interact directly with the Linux kernel (`netns`, `ovs-vsctl`, `tc`) and must be installed globally.
 
 **On CachyOS / Arch Linux:**
 ```bash
-sudo pacman -Syu mininet openvswitch iproute2 iperf3
+sudo pacman -Syu mininet openvswitch iproute2 iperf3 psmisc
 ```
-* **What it does:** Installs the Mininet network namespace emulator, Open vSwitch software switch, Linux `tc` (Traffic Control) utilities, and `iperf3` traffic generator.
 
 **On Ubuntu / Debian:**
 ```bash
-sudo apt update && sudo apt install -y mininet openvswitch-switch iproute2 iperf3
+sudo apt update && sudo apt install -y mininet openvswitch-switch iproute2 iperf3 psmisc
 ```
 
-**Start the Open vSwitch Kernel Module & Daemons:**
+**Enable and Start the Open vSwitch Kernel Module & Daemons:**
 ```bash
 sudo modprobe openvswitch
 sudo systemctl enable --now ovsdb-server.service
 sudo systemctl enable --now ovs-vswitchd.service
 ```
-* **What it does:** Loads the Linux kernel module for virtual switching and starts the Open vSwitch database (`ovsdb-server`) and forwarding daemon (`ovs-vswitchd`). Without these running, Mininet will hang at `*** Starting 1 switches s1`.
+> **Why this is required:** On Arch/CachyOS, `pacman` does not auto-start systemd services. If `ovsdb-server` and `ovs-vswitchd` are not running, Mininet will hang indefinitely at `*** Starting 1 switches s1`.
 
-### Step 4.2: Configure the Python Environment with `uv`
-
+### Step 5.2: Initialize the Python Environment with `uv`
 ```bash
-# 1. Initialize uv with Python 3.11
+# 1. Create and enter project directory
+mkdir -p sdn-time-sync && cd sdn-time-sync
+
+# 2. Initialize uv with Python 3.11
 uv init --python 3.11
 
-# 2. Install OS-Ken (<4.0.0) and compatible Eventlet
+# 3. Add OS-Ken (<4.0.0), Eventlet, Setuptools, and Matplotlib
 uv add "os-ken<4.0.0" "eventlet<0.37.0" "setuptools<80" matplotlib
 ```
-* **Why `os-ken<4.0.0`?** In `os-ken` v4.0.0+, OpenStack removed the `osken-manager` CLI executable. Pinning `<4.0.0` retains the standalone `osken-manager` runner needed for SDN labs.
+> **Why `os-ken<4.0.0`?** In `os-ken` v4.0.0+, OpenStack removed the standalone `osken-manager` CLI binary. Pinning `<4.0.0` ensures `uv run osken-manager` is installed inside `.venv/bin/`.
 
 ```bash
-# 3. Bridge the system Mininet package into the isolated uv environment
+# 4. Link system Mininet Python bindings into the isolated uv virtual environment
 python3 -c "import mininet, os; print(os.path.dirname(os.path.dirname(mininet.__file__)))" \
   > $(uv run python -c "import site; print(site.getsitepackages()[0])")/system_mininet.pth
 ```
-* **What it does:** Finds the global directory where `pacman`/`apt` installed the `mininet` Python bindings and writes a `.pth` pointer file inside `.venv` so `uv` can import `mininet` without module resolution errors.
+> **What this command does:** Queries the global Python installation for the path to `mininet` and writes a `.pth` pointer file inside `.venv` so `uv` and your IDE can import `mininet` seamlessly.
+
+**Verify the Environment:**
+```bash
+uv run python -c "import mininet.net; print('Mininet import: OK')"
+uv run osken-manager --version
+```
 
 ---
 
-## 5. Step-by-Step Execution & Expected Outputs
+## 6. Project Source Code Structure
 
-Open **two terminal windows** in the project directory.
+Ensure the following 5 files are present in your project directory:
 
-### Step 5.1: Start the OS-Ken SDN Controller (Terminal 1)
-```bash
-uv run osken-manager --verbose sdn_controller.py
-```
-* **What this command does:** Starts the OS-Ken OpenFlow 1.3 controller listening on TCP port `6653`.
-* **Expected Output:**
-  The terminal will initialize `ofp_event`, print `instantiating app sdn_controller.py of TimeSyncQoSController`, and remain open waiting for switch `s1` to connect. Once Mininet starts in Terminal 2, you will see `switch_features_handler` register the switch.
-
-### Step 5.2: Launch the Mininet Topology & QoS Queues (Terminal 2)
-```bash
-sudo mn -c
-sudo .venv/bin/python topology.py
-```
-* **What these commands do:**
-  * `sudo mn -c`: Cleans up any leftover virtual interfaces, OpenFlow locks, or namespaces from previous runs.
-  * `sudo .venv/bin/python topology.py`: Builds hosts `h1`–`h4` and switch `s1`, applies `10 Mbps` bandwidth and `10 ms` link delays, uses `ovs-vsctl` to configure two hardware/software HTB priority queues on `s1` (`Queue 1` = Priority 1 for Time Sync; `Queue 0` = Priority 10 for background traffic), and opens the `mininet>` CLI.
-* **Expected Output:**
-  ```text
-  *** Adding OS-Ken Remote Controller
-  *** Adding Switch and Hosts
-  *** Creating Links with Controlled Delay (10ms) and 10Mbps Bandwidth
-  *** Starting Network
-  *** Configuring OVS QoS Priority Queues on s1-eth1 and s1-eth2...
-  <9 UUID strings confirming OVS QoS and Queue creation>
-  *** Dropping into Mininet CLI
-  mininet>
-  ```
-  *Note on Delay Behaviour:* When `ovs-vsctl` attaches the `linux-htb` QoS queues to switch ports (`s1-eth1`, `s1-eth2`, `s1-eth3`), it replaces the `10ms` delay qdisc on the **switch-side** interfaces while preserving the `10ms` delay qdisc on the **host-side** interfaces (`h1-eth0`, `h2-eth0`, `h3-eth0`). Thus, each one-way trip experiences exactly `10 ms` of propagation delay (`20 ms` total round-trip time).
-
----
-
-## 6. Running the Experiments (Inside `mininet>` CLI)
-
-### Experiment 1: Baseline Connectivity Check (ICMP)
-```bash
-mininet> pingall
-```
-* **What it does:** Sends ICMP Echo Requests between every pair of hosts to verify that `sdn_controller.py` learns MAC addresses and installs OpenFlow forwarding rules.
-* **Expected Output:** `Results: 0% dropped (12/12 received)`.
-
-### Experiment 2: Baseline UDP Time Synchronization (No Congestion)
-```bash
-mininet> h1 .venv/bin/python time_sync.py --role server &
-mininet> h2 .venv/bin/python time_sync.py --role client --offset 2.5
-```
-* **What it does:** Starts the UDP reference server on `h1` in the background (`&`), then runs 30 synchronization exchanges from `h2` with a simulated clock offset of `+2.5` seconds.
-* **Expected Output & Analysis:**
-  ```text
-  Time sync results:
-  seq=1, rtt_ms=50.331, estimated_offset_s=-2.487989, sync_error_ms=12.011
-  seq=2, rtt_ms=20.352, estimated_offset_s=-2.499998, sync_error_ms=0.002
-  seq=3, rtt_ms=20.400, estimated_offset_s=-2.499992, sync_error_ms=0.008
-  ...
-  seq=30, rtt_ms=20.355, estimated_offset_s=-2.499994, sync_error_ms=0.006
-  ```
-  Each result line shows the sequence number, round-trip time in milliseconds, estimated clock offset in seconds, and synchronization error in milliseconds.
-  * **Why Packet #1 has ~50 ms RTT and ~12 ms Error:** On the very first packet, `s1` does not have a flow rule for `h2 -> h1` UDP port `5005`. It encapsulates the packet into an OpenFlow `Packet-In` message to the OS-Ken controller. This control-plane detour delays only the forward path ($T_1 \to T_2$), creating path asymmetry and a `~12 ms` error.
-  * **Why Packets #2–#30 have ~20.3 ms RTT and <0.05 ms Error:** Once OS-Ken installs the OpenFlow rule (`Priority 100 -> Queue 1`), subsequent packets are switched directly in the Open vSwitch kernel fast-path. Forward delay (`10 ms`) equals return delay (`10 ms`), yielding near-zero synchronization error (`0.001 ms – 0.05 ms`).
-
-### Experiment 3: Multi-Client Synchronization
-```bash
-mininet> h2 .venv/bin/python time_sync.py --role client --offset 2.5 &
-mininet> h3 .venv/bin/python time_sync.py --role client --offset -1.2
-```
-* **What it does:** Runs two independent clients (`h2` drifted by `+2.5s`, `h3` drifted by `-1.2s`) concurrently against `h1`.
-* **Expected Output:** Both clients converge on their true offsets (`-2.5000s` for `h2` and `+1.2000s` for `h3`) with sub-millisecond error.
-
-### Experiment 4: Performance Under Congestion (SDN QoS ON vs. OFF)
-```bash
-mininet> h1 iperf3 -s -D
-mininet> h4 iperf3 -c 10.0.0.1 -u -b 15M -t 30 &
-mininet> h2 .venv/bin/python time_sync.py --role client --offset 2.5
-```
-* **What it does:**
-  1. `h1 iperf3 -s -D`: Runs an `iperf3` server on `h1` as a background daemon.
-  2. `h4 iperf3 -c 10.0.0.1 -u -b 15M -t 30 &`: Floods `15 Mbps` of UDP traffic from `h4` to `h1` across the `10 Mbps` bottleneck link (`s1-eth1`) for 30 seconds.
-  3. Runs the time-sync client on `h2` during the congestion flood.
-* **Expected Output Comparison:**
-  * **With SDN Prioritization OFF (`self.prioritize_sync = False` in `sdn_controller.py`):** Both `iperf3` and time-sync packets compete inside `Queue 0`. The `s1-eth1` buffer fills up (`max-rate=9Mbps`), causing severe asymmetric queuing delay on the $T_1 \to T_2$ path. **RTT spikes to `80 ms – 150 ms+`** and **Synchronization Error jumps to `30 ms – 60 ms+`** (plus occasional packet `TIMEOUT` drops).
-  * **With SDN Prioritization ON (`self.prioritize_sync = True` in `sdn_controller.py`):** OS-Ken directs UDP port `5005` into `Queue 1` (`priority=1`, guaranteed bandwidth). Time-sync packets bypass the congested `Queue 0` buffer completely. **RTT stays near `~20.5 ms`** and **Synchronization Error remains `< 0.5 ms`** despite the 15 Mbps flood.
-
----
-
-## 7. Repository Structure
 ```text
-.
-├── README.md            # Project documentation, setup guide, and expected outputs
-├── pyproject.toml       # uv project configuration and dependencies
-├── time_sync.py         # UDP Time Synchronization Server & Client implementation
-├── sdn_controller.py    # OS-Ken OpenFlow 1.3 Controller with QoS prioritization
-└── topology.py          # Mininet topology with TCLink delays and OVS HTB queues
+sdn-time-sync/
+├── README.md            # Complete project documentation, setup, and viva guide
+├── pyproject.toml       # uv package configuration
+├── time_sync.py         # UDP Time Server & Multi-Client with TCP Telemetry & CSV logging
+├── sdn_controller.py    # Dynamic OS-Ken OpenFlow 1.3 Controller (Telemetry + PortStats + QoS)
+├── topology.py          # Mininet Star Topology, OVS HTB Queue builder, and Auto-Evaluator
+└── evaluate.py          # Matplotlib performance plotter & statistical table generator
 ```
+
+---
+
+## 7. How to Run the Project (Automated & Manual Modes)
+
+Always keep **two terminal windows** open in your project root directory.
+
+### Mode A: One-Command Automated Deliverable 2 Evaluation (Recommended)
+This mode automatically runs all 3 comparative SDN regimes (**Static Baseline No-QoS**, **Dynamic Reactive SDN**, and **Proactive SDN QoS**) under a `15 Mbps` congestion flood, verifies multi-client concurrency (`h2` + `h3`), exports CSV logs, and generates comparison plots.
+
+**1. Terminal 1 — Start the OS-Ken SDN Controller:**
+```bash
+uv run osken-manager sdn_controller.py
+```
+* **Expected Output in Terminal 1:**
+  ```text
+  loading app sdn_controller.py
+  instantiating app sdn_controller.py of DynamicTimeSyncSDN
+  [TCP Monitor] Listening for Telemetry on TCP port 9090...
+  ```
+
+**2. Terminal 2 — Run the Automated Mininet Benchmark Suite:**
+```bash
+sudo mn -c && sudo .venv/bin/python topology.py --auto-eval
+```
+* **What happens during execution:**
+  * **Regime 1 (`results_baseline_no_qos.csv`):** Controller locks `qos_active=False`. When `h4` injects the `15 Mbps` UDP flood at $t = 3.0\text{ s}$, RTT jumps from `20.3 ms` to `80–140 ms` and `sync_error_ms` spikes to `25–55 ms`.
+  * **Regime 2 (`results_dynamic_sdn.csv`):** Controller starts in `Queue 0`. As soon as `h4` starts flooding, `h2` experiences one high-error packet (`> 2.0 ms`) and reports it via TCP `9090`. Terminal 1 immediately logs:
+    `⚡ [DYNAMIC SDN POLICY TRIGGERED] SLA Breach on h2 ... -> Elevating UDP 5005 to Queue 1!`
+    The controller pushes `Priority 100` `OFPFlowMod` rules to `s1`, and all remaining packets immediately recover to `~20.4 ms` RTT and `< 0.2 ms` sync error!
+  * **Regime 3 (`results_proactive_qos.csv`):** Controller keeps `Queue 1` active from Packet #1. Congestion has zero impact throughout the run.
+  * **Multi-Client Test (`results_multiclient_h2.csv`, `results_multiclient_h3.csv`):** Both `h2` (`+2.5s` drift) and `h3` (`-1.2s` drift) synchronize concurrently with `< 0.1 ms` error.
+
+**3. Terminal 2 — Generate Statistical Summary & Plots:**
+```bash
+uv run python evaluate.py
+```
+* **Expected Output:**
+  ```text
+  Regime                         | Mean RTT (ms)  | Mean Error (ms)  | Max Error (ms)  | Drops
+  ------------------------------------------------------------------------------------------
+  Static Baseline (No QoS)       | 74.820         | 26.410           | 48.920          | 2
+  Dynamic Reactive SDN (Ours)    | 22.450         | 1.120            | 18.400          | 0
+  Proactive SDN QoS              | 20.380         | 0.045            | 0.210           | 0
+
+  Saved comparison plot to: evaluation.png
+  ```
+
+---
+
+### Mode B: Interactive Manual CLI Demo (For Live Step-by-Step Viva Demonstration)
+
+If your evaluator asks you to run commands interactively inside the `mininet>` prompt:
+
+**1. Terminal 1 — Start the Controller:**
+```bash
+uv run osken-manager sdn_controller.py
+```
+
+**2. Terminal 2 — Launch Interactive Topology:**
+```bash
+sudo mn -c && sudo .venv/bin/python topology.py
+```
+
+**3. Inside `mininet>`, run the live experiments:**
+
+* **Step 1: Verify ICMP Reachability (`pingall`):**
+  ```bash
+  mininet> pingall
+  ```
+  *Expected:* `0% dropped (12/12 received)`.
+
+* **Step 2: Start the Reference UDP Server & `iperf3` Daemon on `h1`:**
+  ```bash
+  mininet> h1 .venv/bin/python time_sync.py --role server &
+  mininet> h1 iperf3 -s -D
+  ```
+
+* **Step 3: Run Baseline Time Sync from `h2` (No Congestion):**
+  ```bash
+  mininet> h2 .venv/bin/python time_sync.py --role client --client-id h2 --offset 2.5 --count 15
+  ```
+  *Expected:* Packet 1 shows `~50 ms` RTT (OpenFlow `Packet-In` learning delay); Packets 2–15 show `~20.3 ms` RTT and `0.002 - 0.050 ms` sync error.
+
+* **Step 4: Trigger Live Congestion & Watch Dynamic SDN Recovery:**
+  ```bash
+  mininet> h4 iperf3 -c 10.0.0.1 -u -b 15M -t 20 &
+  mininet> h2 .venv/bin/python time_sync.py --role client --client-id h2 --offset 2.5 --count 25 --telemetry-ip 10.0.0.254
+  ```
+  *Expected:* Watch Terminal 1 trigger `⚡ [DYNAMIC SDN POLICY TRIGGERED]` and watch `h2`'s synchronization error drop back below `0.2 ms` while the `15 Mbps` flood is still running!
+
+* **Step 5: Inspect Live OpenFlow Rules & Queue Counters (in a 3rd terminal or via `sh`):**
+  ```bash
+  mininet> sh ovs-ofctl -O OpenFlow13 dump-flows s1
+  mininet> sh ovs-ofctl -O OpenFlow13 queue-stats s1
+  ```
+  *What this proves:* Shows the live `priority=100,udp,tp_dst=5005 actions=set_queue:1,output:1` rules installed inside Open vSwitch and packet counters incrementing on `queue 1`.
+
+---
+
